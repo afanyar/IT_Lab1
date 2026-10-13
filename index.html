@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TableDB</title>
+<style>
+  body { font: 14px system-ui, sans-serif; margin: 0; color: #222; }
+  header { display: flex; gap: 8px; align-items: center; padding: 8px 12px; background: #f1f3f5; border-bottom: 1px solid #ccc; }
+  header b { margin-right: 8px; }
+  #dbname { margin-left: auto; color: #555; }
+  main { display: flex; min-height: calc(100vh - 80px); }
+  aside { width: 200px; padding: 12px; border-right: 1px solid #ddd; }
+  section { flex: 1; padding: 12px; overflow-x: auto; }
+  ul { list-style: none; padding: 0; margin: 0 0 8px; }
+  li { padding: 4px 8px; cursor: pointer; border-radius: 4px; }
+  li:hover { background: #eef; }
+  li.sel { background: #cde; }
+  button { padding: 4px 10px; cursor: pointer; }
+  table { border-collapse: collapse; margin-top: 8px; }
+  th, td { border: 1px solid #ccc; padding: 4px 10px; text-align: left; }
+  th { background: #f1f3f5; cursor: pointer; user-select: none; }
+  td.act { white-space: nowrap; }
+  td.act button { margin-right: 4px; }
+  #status { padding: 6px 12px; color: #555; border-top: 1px solid #ddd; }
+  dialog { border: 1px solid #888; border-radius: 6px; min-width: 320px; }
+  .form { display: grid; grid-template-columns: auto 1fr; gap: 6px 8px; align-items: center; }
+  .frow { display: flex; gap: 4px; margin: 4px 0; }
+  .btns { display: flex; gap: 8px; margin-top: 12px; }
+  .err { color: #c00; min-height: 1.2em; margin: 8px 0 0; }
+</style>
+</head>
+<body>
+<header>
+  <b>TableDB</b>
+  <button id="newDb">Нова БД</button>
+  <button id="save">Зберегти</button>
+  <button id="load">Завантажити</button>
+  <span id="dbname"></span>
+</header>
+<main>
+  <aside>
+    <h3>Таблиці</h3>
+    <ul id="tables"></ul>
+    <button id="createTable">Створити</button>
+    <button id="dropTable">Видалити</button>
+  </aside>
+  <section id="tableArea" hidden>
+    <b id="tname"></b>
+    <button id="addRow">Додати рядок</button>
+    <span style="color:#777"> Сортування: клік по заголовку стовпця</span>
+    <table id="grid"></table>
+  </section>
+</main>
+<div id="status"></div>
+<dialog id="dlg"></dialog>
+
+<script>
+const HINTS = { integer: 'ціле число', real: 'дійсне число', char: '1 символ', string: 'текст',
+                time: 'ГГ:ХХ[:СС]', timeInvl: 'ГГ:ХХ[:СС]-ГГ:ХХ[:СС]' };
+const st = { table: null, fields: [], rows: [], sortBy: null, desc: false };
+const $ = id => document.getElementById(id);
+
+// створює DOM-елемент; текст завжди через textContent (захист від XSS)
+function h(tag, props = {}, ...kids) {
+  const el = Object.assign(document.createElement(tag), props);
+  el.append(...kids);
+  return el;
+}
+
+async function api(method, path, body) {
+  let resp;
+  try {
+    resp = await fetch(path, { method, headers: { 'Content-Type': 'application/json' },
+                               body: body === undefined ? undefined : JSON.stringify(body) });
+  } catch (e) {
+    throw new Error('Немає зв\'язку з сервером');
+  }
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data.error || 'HTTP ' + resp.status);
+  return data;
+}
+
+const tpath = () => '/api/tables/' + encodeURIComponent(st.table);
+async function guard(fn) { try { await fn(); } catch (e) { alert(e.message); } }
+
+// ---------- діалог: помилки сервера показуються всередині, ввід не втрачається
+function openDialog(title, body, onOk) {
+  const dlg = $('dlg');
+  const err = h('p', { className: 'err' });
+  const form = h('form', {}, h('h3', { textContent: title }), body, err,
+    h('div', { className: 'btns' },
+      h('button', { type: 'submit', textContent: 'OK' }),
+      h('button', { type: 'button', textContent: 'Скасувати', onclick: () => dlg.close() })));
+  form.onsubmit = async e => {
+    e.preventDefault();
+    try { await onOk(); dlg.close(); } catch (ex) { err.textContent = ex.message; }
+  };
+  dlg.replaceChildren(form);
+  dlg.showModal();
+}
+
+// ---------- відображення
+async function refresh() {
+  const info = await api('GET', '/api/database');
+  $('dbname').textContent = 'БД: ' + info.name;
+  if (!info.tables.includes(st.table)) st.table = null;
+  $('tables').replaceChildren(...info.tables.map(n => h('li', {
+    textContent: n, className: n === st.table ? 'sel' : '',
+    onclick: () => { st.table = n; st.sortBy = null; st.desc = false; guard(refresh); } })));
+  await loadRows();
+}
+
+async function loadRows() {
+  $('tableArea').hidden = !st.table;
+  if (!st.table) { $('status').textContent = ''; return; }
+  const q = st.sortBy ? `?sort_by=${encodeURIComponent(st.sortBy)}&desc=${st.desc ? 1 : 0}` : '';
+  const data = await api('GET', tpath() + '/rows' + q);
+  st.fields = data.fields; st.rows = data.rows;
+  $('tname').textContent = st.table;
+
+  const head = h('tr');
+  st.fields.forEach(f => {
+    const arrow = f.name === st.sortBy ? (st.desc ? ' ▼' : ' ▲') : '';
+    head.append(h('th', { textContent: `${f.name} [${f.type}]${arrow}`,
+      onclick: () => { st.desc = st.sortBy === f.name ? !st.desc : false; st.sortBy = f.name; guard(loadRows); } }));
+  });
+  head.append(h('th'));
+  const rows = st.rows.map(r => {
+    const tr = h('tr');
+    st.fields.forEach(f => tr.append(h('td', { textContent: String(r.values[f.name]) })));
+    tr.append(h('td', { className: 'act' },
+      h('button', { textContent: 'Редагувати', onclick: () => editRow(r) }),
+      h('button', { textContent: 'Видалити', onclick: () => deleteRow(r.id) })));
+    return tr;
+  });
+  $('grid').replaceChildren(h('thead', {}, head), h('tbody', {}, ...rows));
+  $('status').textContent = `Таблиця ${st.table}: рядків — ${st.rows.length}`;
+}
+
+// ---------- рядки
+function rowDialog(title, initial, onSave) {
+  const inputs = {};
+  const form = h('div', { className: 'form' });
+  st.fields.forEach(f => {
+    inputs[f.name] = h('input', { value: initial[f.name] === undefined ? '' : String(initial[f.name]),
+                                  placeholder: HINTS[f.type] });
+    form.append(h('label', { textContent: `${f.name} (${f.type})` }), inputs[f.name]);
+  });
+  openDialog(title, form, () => onSave(
+    Object.fromEntries(Object.entries(inputs).map(([k, i]) => [k, i.value]))));
+}
+
+$('addRow').onclick = () => rowDialog('Новий рядок', {}, async values => {
+  await api('POST', tpath() + '/rows', { values });
+  await loadRows();
+});
+
+function editRow(r) {
+  rowDialog('Редагування рядка', r.values, async values => {
+    await api('PUT', `${tpath()}/rows/${r.id}`, { values });
+    await loadRows();
+  });
+}
+
+function deleteRow(id) {
+  if (!confirm('Видалити рядок?')) return;
+  guard(async () => { await api('DELETE', `${tpath()}/rows/${id}`); await loadRows(); });
+}
+
+// ---------- таблиці
+$('createTable').onclick = () => guard(async () => {
+  const types = (await api('GET', '/api/types')).types;
+  const name = h('input', { placeholder: 'назва таблиці' });
+  const list = h('div');
+  const addField = () => {
+    const row = h('div', { className: 'frow' });
+    row.append(h('input', { placeholder: 'назва поля' }),
+               h('select', {}, ...types.map(t => h('option', { textContent: t }))),
+               h('button', { type: 'button', textContent: '✕', onclick: () => row.remove() }));
+    list.append(row);
+  };
+  addField();
+  const body = h('div', {}, h('div', {}, name), list,
+                 h('button', { type: 'button', textContent: '+ Поле', onclick: addField }));
+  openDialog('Нова таблиця', body, async () => {
+    const fields = [...list.children].map(r => ({ name: r.children[0].value.trim(), type: r.children[1].value }));
+    const nm = name.value.trim();
+    await api('POST', '/api/tables', { name: nm, fields });
+    st.table = nm; st.sortBy = null; st.desc = false;
+    await refresh();
+  });
+});
+
+$('dropTable').onclick = () => {
+  if (st.table && confirm(`Видалити таблицю «${st.table}»?`))
+    guard(async () => { await api('DELETE', tpath()); st.table = null; await refresh(); });
+};
+
+// ---------- база
+$('newDb').onclick = () => guard(async () => {
+  const n = prompt('Назва бази:');
+  if (!n) return;
+  await api('POST', '/api/database', { name: n.trim() });
+  st.table = null;
+  await refresh();
+});
+
+$('save').onclick = () => guard(async () => {
+  const n = prompt('Ім\'я файлу на сервері:');
+  if (!n) return;
+  await api('POST', '/api/database/save', { filename: n.trim() });
+  $('status').textContent = 'Збережено: ' + n.trim();
+});
+
+$('load').onclick = () => guard(async () => {
+  const files = (await api('GET', '/api/files')).files;
+  if (!files.length) { alert('На сервері немає збережених баз'); return; }
+  const n = prompt('Доступні: ' + files.join(', ') + '\nІм\'я файлу:');
+  if (!n) return;
+  await api('POST', '/api/database/load', { filename: n.trim() });
+  st.table = null;
+  await refresh();
+});
+
+guard(refresh);
+</script>
+</body>
+</html>
